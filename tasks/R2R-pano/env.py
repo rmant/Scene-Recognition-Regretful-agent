@@ -11,10 +11,26 @@ import math
 import base64
 import random
 import networkx as nx
+import pandas as pd
 
 from utils import load_datasets, load_nav_graphs, print_progress, is_experiment
 
 csv.field_size_limit(sys.maxsize)
+
+# Manually map from viewpoint categories provided in MatterPort metadata to numerical classes
+classes = {
+    'h': 0,
+    'z': 1,
+    'b': 2,
+    'l': 3,
+    'a': 4,
+    'x': 5,
+    'k': 6,
+    's': 7,
+    'd': 8,
+    'e': 9,
+    'o': 10,
+}
 
 def load_features(feature_store):
     def _make_id(scanId, viewpointId):
@@ -137,7 +153,17 @@ class R2RPanoBatch():
         self.ix = 0
         self.batch_size = batch_size
         self._load_nav_graphs()
+        self._load_categories()
         print('R2RBatch loaded with %d instructions, using splits: %s' % (len(self.data), ",".join(splits)))
+
+    def _load_categories(self):
+        """ Load Category labels for each viewpoint"""
+        print('Loading category labels')
+        self.scans_categories = {}
+        for scan in self.scans:
+            df = pd.read_csv('scans/{}/viewpoints_short.csv'.format(scan)).set_index(['name'])
+            df['class'] = df['category'].apply(lambda x: classes[x])
+            self.scans_categories[scan] = df.to_dict()['class']
 
     def _load_nav_graphs(self):
         """ Load connectivity graph for each scan, useful for reasoning about shortest paths """
@@ -354,6 +380,13 @@ class R2RPanoBatch():
             if 'synthetic' in self.splits:
                 item['instr_id'] = str(item['path_id'])
 
+            # Sometimes there are viewpoints that doesn't appear in the scan. We assign those to "other" category.
+            if state.location.viewpointId in self.scans_categories[state.scanId].keys():
+                vp_class = self.scans_categories[state.scanId][state.location.viewpointId]
+            else:
+                print("Viewpoint {} not found in scan {}".format(state.location.viewpointId, state.scanId))
+                vp_class = classes['z']
+
             obs.append({
                 'instr_id': item['instr_id'],
                 'scan': state.scanId,
@@ -367,7 +400,8 @@ class R2RPanoBatch():
                 'instructions': item['instructions'],
                 'teacher': item['path'],
                 'new_teacher': self.paths[state.scanId][state.location.viewpointId][item['path'][-1]],
-                'gt_viewpoint_idx': gt_viewpoint_idx
+                'gt_viewpoint_idx': gt_viewpoint_idx,
+                'viewpoint_class': vp_class
             })
             if 'instr_encoding' in item:
                 obs[-1]['instr_encoding'] = item['instr_encoding']
