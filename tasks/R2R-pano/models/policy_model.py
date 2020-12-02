@@ -56,6 +56,14 @@ class Regretful(nn.Module):
 
         self.move_fc = nn.Linear(img_fc_dim[-1], img_fc_dim[-1] + opts.tiled_len)
 
+        self.viewpoint_fc = nn.Sequential(
+            # nn.BatchNorm1d(rnn_hidden_size),
+            nn.Linear(rnn_hidden_size, rnn_hidden_size),
+            self.dropout,
+            nn.Linear(rnn_hidden_size, 11),
+            nn.Softmax()
+        )
+
         self.num_predefined_action = 1
 
     def block_oscillation(self, batch_size, navigable_mask, oscillation_index, block_oscillation_index):
@@ -156,8 +164,10 @@ class Regretful(nn.Module):
         # =========== Action selection with Progress Marker ===========
         logit = torch.bmm(proj_navigable_feat_visited, self.move_fc(m_forward_rollback).unsqueeze(2)).squeeze(2)
 
+        # Scene Recognition Auxiliary task
+        vp_class = self.viewpoint_fc(h_1_drop)
 
-        return h_1, c_1, img_attn, ctx_attn, rollback_forward_attn, logit, rollback_forward_logit, value, navigable_mask
+        return h_1, c_1, img_attn, ctx_attn, rollback_forward_attn, logit, rollback_forward_logit, value, navigable_mask, vp_class
 
 
 class SelfMonitoring(nn.Module):

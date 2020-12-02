@@ -96,10 +96,10 @@ class PanoBaseAgent(object):
         pano_img_feat = torch.zeros(len(obs), num_feature, feature_size)
         navigable_feat = torch.zeros(len(obs), self.opts.max_navigable, feature_size)
 
-        navigable_feat_index, target_index, viewpoints = [], [], []
+        navigable_feat_index, target_index, viewpoints, vp_labels = [], [], [], []
         for i, ob in enumerate(obs):
             pano_img_feat[i, :] = torch.from_numpy(ob['feature'])  # pano feature: (batchsize, 36 directions, 2048)
-
+            vp_labels.append(ob['viewpoint_class'])
             index_list = []
             viewpoints_tmp = []
             gt_viewpoint_id, viewpoint_idx = ob['gt_viewpoint_idx']
@@ -124,7 +124,7 @@ class PanoBaseAgent(object):
 
             navigable_feat[i, 1:len(navi_index) + 1] = pano_img_feat[i, navi_index]
 
-        return pano_img_feat, navigable_feat, (viewpoints, navigable_feat_index, target_index)
+        return pano_img_feat, navigable_feat, (viewpoints, navigable_feat_index, target_index, vp_labels)
 
     def pano_navigable_feat_progress_marker(self, step, obs, ended, visited_viewpoints_value,
                                                     progress_marker=1, tiled_len=32, is_training=True):
@@ -138,6 +138,7 @@ class PanoBaseAgent(object):
         navigable_feat_index = []
         target_index = []
         viewpoints = []
+        vp_labels = []
         visited_index = []
         visited_viewpoints = []
         last_visited_index = []
@@ -157,6 +158,7 @@ class PanoBaseAgent(object):
 
             gt_viewpoint_id, viewpoint_idx = ob['gt_viewpoint_idx']
             current_viewpoint = ob['viewpoint']
+            vp_labels.append(ob['viewpoint_class'])
 
             for j, viewpoint_id in enumerate(ob['navigableLocations']):
 
@@ -211,7 +213,7 @@ class PanoBaseAgent(object):
         else:
             last_visited_index = [-1] * len(obs)
 
-        return pano_img_feat, navigable_feat, (viewpoints, navigable_feat_index, target_index, visited_index, visited_viewpoints, last_visited_index, previous_oscillation)
+        return pano_img_feat, navigable_feat, (viewpoints, navigable_feat_index, target_index, visited_index, visited_viewpoints, last_visited_index, previous_oscillation, vp_labels)
 
     def _sort_batch(self, obs):
         """ Extract instructions from a list of observations and sort by descending
@@ -324,6 +326,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         self.longest_dist = [traj_tmp['distance'][0] for traj_tmp in traj]
         self.traj_length = [1] * batch_size
         self.value_loss = torch.tensor(0).float().to(self.device)
+        self.aux_loss = torch.tensor(0).float().to(self.device)
 
         ended = np.array([False] * batch_size)
         last_recorded = np.array([False] * batch_size)
@@ -377,6 +380,10 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         # initialize the trajectory
         traj, scan_id, ended, last_recorded = self.init_traj(obs)
+        # Store gt categories and predicted categories
+        gt_categories = []
+        predicted_categories = []
+
         loss = 0
         visited_viewpoints_value = [{} for _ in range(batch_size)]
         value = torch.zeros(batch_size, 1).to(self.device)  # progress monitor values at the beginning
@@ -386,22 +393,29 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
                 super(PanoSeq2SeqAgent, self).pano_navigable_feat_progress_marker(step, obs, ended,
                                                                           visited_viewpoints_value, progress_marker=self.opts.progress_marker,
                                                                           tiled_len=self.opts.tiled_len, is_training=self.encoder.training)
-            viewpoints, navigable_index, target_index, visited_navigable_index, visited_viewpoints, navigable_idx_to_previous, previous_oscillation = viewpoints_indices
+            viewpoints, navigable_index, target_index, visited_navigable_index, visited_viewpoints, navigable_idx_to_previous, previous_oscillation, target_room = viewpoints_indices
             block_oscillation = previous_oscillation
             oscillation_index = navigable_idx_to_previous
 
             pano_img_feat = pano_img_feat.to(self.device)
             navigable_feat = navigable_feat.to(self.device)
             target = torch.LongTensor(target_index).to(self.device)
+            target_room = torch.LongTensor(target_room).to(self.device)
 
             # forward pass the network
             h_t, c_t, img_attn, ctx_attn, rollback_forward_attn, \
-            logit, rollback_forward_logit, value, navigable_mask = self.model(
+            logit, rollback_forward_logit, value, navigable_mask, vp_class = self.model(
                 pano_img_feat, navigable_feat, pre_feat, value.detach(), h_t, c_t,
                 ctx, navigable_index, navigable_idx_to_previous, oscillation_index, block_oscillation, ctx_mask, seq_lengths,
                 prevent_oscillation=self.opts.prevent_oscillation,
                 prevent_rollback=self.opts.prevent_rollback,
                 is_training=self.encoder.training)
+
+            # Calculate loss of scene recognition aux task
+            gt_categories.append(target_room)
+            predicted_categories.append(vp_class)
+            aux_loss = self.criterion(vp_class, target_room)
+            self.aux_loss += aux_loss
 
             # Compute the entropy loss of action prob
             # To avoid NaN when multiply prob and logprob, we clone the logit and perform masking
@@ -428,7 +442,8 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
                     current_loss = self.opts.value_loss_weight * current_val_loss + \
                                    (1 - self.opts.value_loss_weight) * self.criterion(logit, target) + \
-                                   self.opts.entropy_weight * entropy_loss
+                                   self.opts.entropy_weight * entropy_loss + \
+                                   0.1 * aux_loss
             else:
                 current_loss = torch.zeros(1)  # during testing where we do not have ground-truth, loss is simply 0
             loss += current_loss
@@ -480,7 +495,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 
-        return loss, traj
+        return loss, traj, (gt_categories, predicted_categories)
 
     def rollout_monitor(self):
         obs = np.array(self.env.reset())  # load a mini-batch
@@ -502,21 +517,32 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
         # initialize the trajectory
         traj, scan_id, ended, last_recorded = self.init_traj(obs)
 
+        # Store gt categories and predicted categories
+        gt_categories = []
+        predicted_categories = []
+
         loss = 0
         for step in range(self.opts.max_episode_len):
 
             pano_img_feat, navigable_feat, \
             viewpoints_indices = super(PanoSeq2SeqAgent, self).pano_navigable_feat(obs, ended)
-            viewpoints, navigable_index, target_index = viewpoints_indices
+            viewpoints, navigable_index, target_index, target_room = viewpoints_indices
 
             pano_img_feat = pano_img_feat.to(self.device)
             navigable_feat = navigable_feat.to(self.device)
             target = torch.LongTensor(target_index).to(self.device)
+            target_room = torch.LongTensor(target_room).to(self.device)
 
             # forward pass the network
-            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask = self.model(
+            h_t, c_t, pre_ctx_attend, img_attn, ctx_attn, logit, value, navigable_mask, vp_class = self.model(
                 pano_img_feat, navigable_feat, pre_feat, question, h_t, c_t, ctx,
                 pre_ctx_attend, navigable_index, ctx_mask)
+
+            # Calculate scene recognition aux task loss
+            gt_categories.append(target_room)
+            predicted_categories.append(vp_class)
+            aux_loss = self.criterion(vp_class, target_room)
+            self.aux_loss += aux_loss
 
             # set other values to -inf so that logsoftmax will not affect the final computed loss
             logit.data.masked_fill_((navigable_mask == 0).data, -float('inf'))
@@ -535,7 +561,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
                     self.value_loss += current_val_loss
                     current_loss = self.opts.value_loss_weight * current_val_loss + (
-                            1 - self.opts.value_loss_weight) * current_logit_loss
+                            1 - self.opts.value_loss_weight) * current_logit_loss +  0.1 * aux_loss
             else:
                 current_loss = torch.zeros(1)  # during testing where we do not have ground-truth, loss is simply 0
             loss += current_loss
@@ -558,7 +584,7 @@ class PanoSeq2SeqAgent(PanoBaseAgent):
 
         self.dist_from_goal = [traj_tmp['distance'][-1] for traj_tmp in traj]
 
-        return loss, traj
+        return loss, traj, (gt_categories, predicted_categories)
 
     def rollout(self):
         obs = np.array(self.env.reset())  # load a mini-batch
