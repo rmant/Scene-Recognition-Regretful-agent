@@ -1,3 +1,7 @@
+## Scene Recognition Auxiliary Task for Regretful Agent
+This repository adds a Scene-Recognition module to self-monitoring agent. Work still in progress. The original readme can be found below.
+
+
 ## The Regretful Navigation Agent for Vision-and-Language Navigation
 <img src="teaser/pytorch-logo-dark.png" width="10%"> [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
 
