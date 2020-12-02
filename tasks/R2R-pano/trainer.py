@@ -21,6 +21,8 @@ class PanoSeq2SeqTrainer():
         movements = AverageMeter()
         val_losses = AverageMeter()
         val_acces = AverageMeter()
+        aux_losses = AverageMeter()
+        accuracy = AverageMeter()
 
         print('Training on {} env ...'.format(train_env.splits[0]))
         # switch to train mode
@@ -43,17 +45,25 @@ class PanoSeq2SeqTrainer():
         for iter in range(1, self.train_iters_epoch + 1):
             # roll out the agent
             if self.opts.arch == 'regretful':
-                loss, traj = self.agent.rollout_regret()
+                loss, traj, categories = self.agent.rollout_regret()
             elif self.opts.arch == 'self-monitoring':
-                loss, traj = self.agent.rollout_monitor()
+                loss, traj, categories = self.agent.rollout_monitor()
             elif self.opts.arch == 'speaker-baseline':
                 loss, traj = self.agent.rollout()
             else:
                 raise NotImplementedError()
 
+            # Calculate aux task accuracy
+            acc = []
+            for gt, predicted in zip(categories[0], categories[1]):
+                max_index = predicted.max(dim = 1)[1]
+                acc.append(((max_index == gt).sum().item())/(max_index.size()[0]))
+            acc = np.mean(acc)*100
+
             dist_from_goal = np.mean(self.agent.dist_from_goal)
             movement = np.mean(self.agent.traj_length)
 
+            accuracy.update(acc, self.opts.batch_size)
             losses.update(loss.item(), self.opts.batch_size)
             dists.update(dist_from_goal, self.opts.batch_size)
             movements.update(movement, self.opts.batch_size)
@@ -63,6 +73,9 @@ class PanoSeq2SeqTrainer():
 
             if self.agent.val_acc is not None:
                 val_acces.update(np.mean(self.agent.val_acc), self.opts.batch_size)
+
+            if self.agent.aux_loss is not None:
+                aux_losses.update(self.agent.aux_loss.item(), self.opts.batch_size)
 
             # zero the gradients before backward pass
             self.optimizer.zero_grad()
@@ -84,6 +97,7 @@ class PanoSeq2SeqTrainer():
                 tb_logger.add_scalar('train/loss_train', loss, current_iter)
                 tb_logger.add_scalar('train/dist_from_goal', dist_from_goal, current_iter)
                 tb_logger.add_scalar('train/movements', movement, current_iter)
+                tb_logger.add_scalar('train/aux_accuracy', acc, current_iter)
                 if self.agent.value_loss is not None:
                     tb_logger.add_scalar('train/value_loss', self.agent.value_loss, current_iter)
 
@@ -102,6 +116,7 @@ class PanoSeq2SeqTrainer():
             tb_logger.add_scalar('epoch/train/loss', losses.avg, epoch)
             tb_logger.add_scalar('epoch/train/dist_from_goal', dists.avg, epoch)
             tb_logger.add_scalar('epoch/train/movements', movements.avg, epoch)
+            tb_logger.add_scalar('epoch/train/aux_accuracy', accuracy.avg, epoch)
             if self.agent.value_loss is not None:
                 tb_logger.add_scalar('epoch/train/val_loss', val_losses.avg, epoch)
             if self.agent.val_acc is not None:
@@ -109,6 +124,8 @@ class PanoSeq2SeqTrainer():
             if self.agent.rollback_attn is not None:
                 for step in range(self.opts.max_episode_len):
                     tb_logger.add_histogram('epoch_train/rollback_attn_{}'.format(step), rollback_attn[step], epoch)
+            if self.agent.aux_loss is not None:
+                tb_logger.add_scalar('epoch/train/aux_loss', aux_losses.avg, epoch)
             tb_logger.add_scalar('rollback_oscillation/train/rollback', rollback_count / len(train_env.data), epoch)
             tb_logger.add_scalar('rollback_oscillation/train/rollback_SR', rollback_success_count / len(train_env.data),
                                  epoch)
@@ -125,6 +142,8 @@ class PanoSeq2SeqTrainer():
         movements = AverageMeter()
         val_losses = AverageMeter()
         val_acces = AverageMeter()
+        aux_losses = AverageMeter()
+        accuracy = AverageMeter()
 
         env_name, (env, evaluator) = val_env
 
@@ -155,17 +174,25 @@ class PanoSeq2SeqTrainer():
 
                 # roll out the agent
                 if self.opts.arch == 'regretful':
-                    loss, traj = self.agent.rollout_regret()
+                    loss, traj, categories = self.agent.rollout_regret()
                 elif self.opts.arch == 'self-monitoring':
-                    loss, traj = self.agent.rollout_monitor()
+                    loss, traj, categories = self.agent.rollout_monitor()
                 elif self.opts.arch == 'speaker-baseline':
                     loss, traj = self.agent.rollout()
                 else:
                     raise NotImplementedError()
 
+                # Calculate accuracy
+                acc = []
+                for gt, predicted in zip(categories[0], categories[1]):
+                    max_index = predicted.max(dim = 1)[1]
+                    acc.append(((max_index == gt).sum().item())/(max_index.size()[0]))
+                acc = np.mean(acc)*100
+
                 dist_from_goal = np.mean(self.agent.dist_from_goal)
                 movement = np.mean(self.agent.traj_length)
 
+                accuracy.update(acc, self.opts.batch_size)
                 losses.update(loss.item(), self.opts.batch_size)
                 dists.update(dist_from_goal, self.opts.batch_size)
                 movements.update(movement, self.opts.batch_size)
@@ -173,12 +200,16 @@ class PanoSeq2SeqTrainer():
                     val_losses.update(self.agent.value_loss.item(), self.opts.batch_size)
                 if self.agent.val_acc is not None:
                     val_acces.update(np.mean(self.agent.val_acc), self.opts.batch_size)
+                if self.agent.aux_loss is not None:
+                    aux_losses.update(self.agent.aux_loss.item(), self.opts.batch_size)
+
 
                 if tb_logger and iter % 10 == 0:
                     current_iter = iter + (epoch - 1) * val_iters_epoch
                     tb_logger.add_scalar('{}/loss'.format(env_name), loss, current_iter)
                     tb_logger.add_scalar('{}/dist_from_goal'.format(env_name), dist_from_goal, current_iter)
                     tb_logger.add_scalar('{}/movements'.format(env_name), movement, current_iter)
+                    tb_logger.add_scalar('{}/aux_acc'.format(env_name), acc, current_iter)
                     if self.agent.value_loss is not None:
                         tb_logger.add_scalar('{}/val_loss'.format(env_name), self.agent.value_loss, current_iter)
 
@@ -234,6 +265,7 @@ class PanoSeq2SeqTrainer():
             tb_logger.add_scalar('epoch/{}/loss'.format(env_name), losses.avg, epoch)
             tb_logger.add_scalar('epoch/{}/dist_from_goal'.format(env_name), dists.avg, epoch)
             tb_logger.add_scalar('epoch/{}/movements'.format(env_name), movements.avg, epoch)
+            tb_logger.add_scalar('epoch/{}/aux_accuracy'.format(env_name), accuracy.avg, epoch)
             if self.agent.value_loss is not None:
                 tb_logger.add_scalar('epoch/{}/val_loss'.format(env_name), val_losses.avg, epoch)
             if self.agent.val_acc is not None:
@@ -241,6 +273,8 @@ class PanoSeq2SeqTrainer():
             if self.agent.rollback_attn is not None:
                 for step in range(self.opts.max_episode_len):
                     tb_logger.add_histogram('epoch_{}/rollback_attn_{}'.format(env_name, step), rollback_attn[step], epoch)
+            if self.agent.aux_loss is not None:
+                tb_logger.add_scalar('epoch/{}/aux_loss'.format(env_name), aux_losses.avg, epoch)
             tb_logger.add_scalar('rollback_oscillation/{}/rollback'.format(env_name), rollback_count / len(env.data), epoch)
             tb_logger.add_scalar('rollback_oscillation/{}/rollback_SR'.format(env_name), rollback_success_count / len(env.data),
                                  epoch)
